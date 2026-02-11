@@ -1,12 +1,12 @@
 ---
 name: telegram-bot-grammy
 description: |
-  Telegram Bot development skill using grammY framework, TypeScript, Prisma ORM, Vitest testing, Biome linting, deployed to Cloudflare Workers with D1 database.
+  Telegram Bot development skill using grammY framework, TypeScript, Drizzle ORM, Vitest testing, Biome linting, deployed to Cloudflare Workers with D1 database.
   Use cases:
   (1) Creating new Telegram Bot projects
   (2) Adding commands or features to existing Bots
   (3) Configuring Cloudflare Workers deployment
-  (4) Setting up Prisma + D1 database integration
+  (4) Setting up Drizzle + D1 database integration
   (5) Writing Bot test cases
   (6) Configuring Git hooks and GitHub Actions CI/CD
 ---
@@ -20,7 +20,7 @@ description: |
 | Framework | [grammY](https://grammy.dev) |
 | Language | TypeScript |
 | Runtime | Cloudflare Workers |
-| ORM | Prisma + @prisma/adapter-d1 |
+| ORM | Drizzle ORM |
 | Database | Cloudflare D1 (SQLite) |
 | Testing | Vitest |
 | Linting | Biome |
@@ -50,41 +50,59 @@ cd my-telegram-bot
 
 ```bash
 # Core dependencies
-pnpm add grammy @prisma/client @prisma/adapter-d1
+pnpm add grammy drizzle-orm
 
 # Dev dependencies
-pnpm add -D prisma vitest @vitest/coverage-v8 @biomejs/biome husky lint-staged
+pnpm add -D drizzle-kit vitest @vitest/coverage-v8 @biomejs/biome husky lint-staged
 ```
 
-### 3. Initialize Prisma
+### 3. Create Drizzle Config (`drizzle.config.ts`)
 
-```bash
-pnpm exec prisma init --datasource-provider sqlite
+```typescript
+import { defineConfig } from "drizzle-kit";
+
+export default defineConfig({
+  schema: "./src/db/schema.ts",
+  out: "./migrations",
+  dialect: "sqlite",
+});
 ```
 
-### 4. Configure Prisma Schema (`prisma/schema.prisma`)
+### 4. Define Database Schema (`src/db/schema.ts`)
 
-```prisma
-generator client {
-  provider        = "prisma-client-js"
-  previewFeatures = ["driverAdapters"]
-}
+```typescript
+import { relations, sql } from "drizzle-orm";
+import { integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
-datasource db {
-  provider = "sqlite"
-  url      = env("DATABASE_URL")
-}
+export const users = sqliteTable(
+  "users",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    telegramId: text("telegram_id").notNull(),
+    username: text("username"),
+    firstName: text("first_name"),
+    createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+    updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  },
+  (table) => [uniqueIndex("users_telegram_id_unique").on(table.telegramId)]
+);
 
-model User {
-  id         Int      @id @default(autoincrement())
-  telegramId BigInt   @unique @map("telegram_id")
-  username   String?
-  firstName  String?  @map("first_name")
-  createdAt  DateTime @default(now()) @map("created_at")
-  updatedAt  DateTime @updatedAt @map("updated_at")
+export const settings = sqliteTable(
+  "settings",
+  {
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    userId: integer("user_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    key: text("key").notNull(),
+    value: text("value"),
+  },
+  (table) => [uniqueIndex("settings_user_id_key_unique").on(table.userId, table.key)]
+);
 
-  @@map("users")
-}
+export const usersRelations = relations(users, ({ many }) => ({
+  settings: many(settings),
+}));
 ```
 
 ### 5. Configure wrangler.toml (Multi-Environment)
@@ -95,7 +113,6 @@ main = "src/index.ts"
 compatibility_date = "2024-01-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Development environment (dev branch)
 [env.dev]
 name = "my-telegram-bot-dev"
 
@@ -107,7 +124,6 @@ binding = "DB"
 database_name = "telegram-bot-db-dev"
 database_id = "<DEV_DATABASE_ID>"
 
-# Production environment (main branch)
 [env.production]
 name = "my-telegram-bot"
 
@@ -138,8 +154,8 @@ pnpm exec wrangler d1 create telegram-bot-db
 # Create migration file
 pnpm exec wrangler d1 migrations create telegram-bot-db-dev init
 
-# Generate SQL
-pnpm exec prisma migrate diff --from-empty --to-schema-datamodel ./prisma/schema.prisma --script --output migrations/0001_init.sql
+# Generate SQL files from Drizzle schema
+pnpm exec drizzle-kit generate
 
 # Apply to development
 pnpm exec wrangler d1 migrations apply telegram-bot-db-dev --local
@@ -166,9 +182,10 @@ pnpm test
 ### Entry File (`src/index.ts`)
 
 ```typescript
-import { PrismaClient } from "@prisma/client";
-import { PrismaD1 } from "@prisma/adapter-d1";
+import { drizzle } from "drizzle-orm/d1";
+import { sql } from "drizzle-orm";
 import { Bot, webhookCallback } from "grammy";
+import { users } from "./db/schema";
 
 export interface Env {
   BOT_TOKEN: string;
@@ -178,9 +195,8 @@ export interface Env {
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const adapter = new PrismaD1(env.DB);
-    const prisma = new PrismaClient({ adapter });
-    
+    const db = drizzle(env.DB);
+
     const bot = new Bot(env.BOT_TOKEN, {
       botInfo: JSON.parse(env.BOT_INFO),
     });
@@ -188,15 +204,21 @@ export default {
     bot.command("start", async (ctx) => {
       const user = ctx.from;
       if (user) {
-        await prisma.user.upsert({
-          where: { telegramId: BigInt(user.id) },
-          update: { username: user.username, firstName: user.first_name },
-          create: {
-            telegramId: BigInt(user.id),
-            username: user.username,
-            firstName: user.first_name,
-          },
-        });
+        await db
+          .insert(users)
+          .values({
+            telegramId: String(user.id),
+            username: user.username ?? null,
+            firstName: user.first_name ?? null,
+          })
+          .onConflictDoUpdate({
+            target: users.telegramId,
+            set: {
+              username: user.username ?? null,
+              firstName: user.first_name ?? null,
+              updatedAt: sql`CURRENT_TIMESTAMP`,
+            },
+          });
       }
       await ctx.reply("Welcome to the Bot!");
     });
@@ -238,7 +260,6 @@ jobs:
           node-version: 20
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec prisma generate
       - run: pnpm run lint
       - run: pnpm run test
 
@@ -252,7 +273,6 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec prisma generate
       - uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -268,19 +288,18 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec prisma generate
       - uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           environment: production
 ```
 
-### GitHub Configuration
+## GitHub Configuration
 
-**Secrets** (Settings → Secrets and variables → Actions):
+**Secrets** (Settings -> Secrets and variables -> Actions):
 - `CLOUDFLARE_API_TOKEN`: Cloudflare API Token
 
-**Environments** (Settings → Environments):
+**Environments** (Settings -> Environments):
 - `development`: Optional protection rules
 - `production`: Recommend configuring Required reviewers
 
@@ -319,6 +338,6 @@ curl "https://api.telegram.org/bot<PROD_TOKEN>/setWebhook?url=https://my-telegra
 ## References
 
 - [grammY Documentation](https://grammy.dev/guide/)
-- [Prisma D1 Guide](https://www.prisma.io/docs/orm/overview/databases/cloudflare-d1)
+- [Drizzle ORM Documentation](https://orm.drizzle.team/docs/overview)
 - [Cloudflare Workers](https://developers.cloudflare.com/workers/)
 - [Wrangler Environments](https://developers.cloudflare.com/workers/wrangler/environments/)

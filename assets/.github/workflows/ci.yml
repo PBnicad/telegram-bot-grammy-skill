@@ -28,9 +28,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Generate Prisma Client
-        run: pnpm exec prisma generate
-
       - name: Lint
         run: pnpm run lint
 
@@ -57,9 +54,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Generate Prisma Client
-        run: pnpm exec prisma generate
-
       - name: Deploy to Development
         uses: cloudflare/wrangler-action@v3
         with:
@@ -85,9 +79,6 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
-
-      - name: Generate Prisma Client
-        run: pnpm exec prisma generate
 
       - name: Deploy to Production
         uses: cloudflare/wrangler-action@v3
